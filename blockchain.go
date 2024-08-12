@@ -1,36 +1,17 @@
 package main
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/gob"
+	"encoding/hex"
 	"fmt"
-	"math"
-	"math/big"
-	"time"
+	"log"
+	"os"
 
 	"go.etcd.io/bbolt"
 )
 
-const (
-	targetBits   = 24
-	maxNonce     = math.MaxInt64
-	dbFile       = "blockchain.db"
-	blocksBucket = "blocks"
-)
-
-type ProofOfWork struct {
-	block  *Block
-	target *big.Int
-}
-
-type Block struct {
-	Timestamp     int64
-	Data          []byte
-	PrevBlockHash []byte
-	Hash          []byte
-	Nonce         int
-}
+const dbFile = "blockchain.db"
+const blocksBucket = "blocks"
+const genesisCoinbaseData = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
 
 type Blockchain struct {
 	tip []byte
@@ -42,54 +23,121 @@ type BlockchainIterator struct {
 	db          *bbolt.DB
 }
 
-func NewProofOfWork(b *Block) *ProofOfWork {
-	target := big.NewInt(1)
-	target.Lsh(target, uint(256-targetBits))
+func (bc *Blockchain) MineBlock(transactions []*Transaction) {
+	var lastHash []byte
 
-	return &ProofOfWork{b, target}
-}
-
-func NewBlockchain() *Blockchain {
-	var tip []byte
-	db, err := bbolt.Open(dbFile, 0600, nil)
-	if err != nil {
-		panic(err)
-	}
-
-	err = db.Update(func(tx *bbolt.Tx) error {
+	err := bc.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
-
-		if b == nil {
-			genesis := NewGenesisBlock()
-			b, err = tx.CreateBucket([]byte(blocksBucket))
-			err = b.Put(genesis.Hash, genesis.Serialize())
-			err = b.Put([]byte("l"), genesis.Hash)
-			tip = genesis.Hash
-		} else {
-			tip = b.Get([]byte("l"))
-		}
+		lastHash = b.Get([]byte("l"))
 
 		return nil
 	})
 
-	bc := Blockchain{tip, db}
+	if err != nil {
+		log.Panic(err)
+	}
 
-	return &bc
+	newBlock := NewBlock(transactions, lastHash)
+
+	err = bc.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		err := b.Put(newBlock.Hash, newBlock.Serialize())
+		if err != nil {
+			log.Panic(err)
+		}
+
+		err = b.Put([]byte("l"), newBlock.Hash)
+		if err != nil {
+			log.Panic(err)
+		}
+
+		bc.tip = newBlock.Hash
+
+		return nil
+	})
 }
 
-func NewGenesisBlock() *Block {
-	return NewBlock("Genesis Block", []byte{})
+func (bc *Blockchain) FindUnspentTransactions(address string) []Transaction {
+	var unspentTXs []Transaction
+	spentTXOs := make(map[string][]int)
+	bci := bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		for _, tx := range block.Transactions {
+			txID := hex.EncodeToString(tx.ID)
+
+		Outputs:
+			for outIdx, out := range tx.Vout {
+				if spentTXOs[txID] != nil {
+					for _, spentOut := range spentTXOs[txID] {
+						if spentOut == outIdx {
+							continue Outputs
+						}
+					}
+				}
+
+				if out.CanBeUnlockedWith(address) {
+					unspentTXs = append(unspentTXs, *tx)
+				}
+			}
+
+			if tx.IsCoinbase() == false {
+				for _, in := range tx.Vin {
+					if in.CanUnlockOutputWith(address) {
+						inTxID := hex.EncodeToString(in.Txid)
+						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.Vout)
+					}
+				}
+			}
+		}
+
+		if len(block.PrevBlockHash) == 0 {
+			break
+		}
+	}
+
+	return unspentTXs
 }
 
-func NewBlock(data string, prevBlockHash []byte) *Block {
-	block := Block{time.Now().Unix(), []byte(data), prevBlockHash, []byte{}, 0}
-	pow := NewProofOfWork(&block)
-	nonce, hash := pow.Run()
+func (bc *Blockchain) FindUTXO(address string) []TXOutput {
+	var UTXOs []TXOutput
+	unspentTransactions := bc.FindUnspentTransactions(address)
 
-	block.Hash = hash[:]
-	block.Nonce = nonce
+	for _, tx := range unspentTransactions {
+		for _, out := range tx.Vout {
+			if out.CanBeUnlockedWith(address) {
+				UTXOs = append(UTXOs, out)
+			}
+		}
+	}
 
-	return &block
+	return UTXOs
+}
+
+func (bc *Blockchain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
+	unspentOutputs := make(map[string][]int)
+	unspentTXs := bc.FindUnspentTransactions(address)
+	accumulated := 0
+
+Work:
+	for _, tx := range unspentTXs {
+		txID := hex.EncodeToString(tx.ID)
+
+		for outIdx, out := range tx.Vout {
+			if out.CanBeUnlockedWith(address) && accumulated < amount {
+				accumulated += out.Value
+				unspentOutputs[txID] = append(unspentOutputs[txID], outIdx)
+
+				if accumulated >= amount {
+					break Work
+				}
+			}
+		}
+	}
+
+	return accumulated, unspentOutputs
 }
 
 func (bc *Blockchain) Iterator() *BlockchainIterator {
@@ -108,8 +156,9 @@ func (i *BlockchainIterator) Next() *Block {
 
 		return nil
 	})
+
 	if err != nil {
-		panic(err)
+		log.Panic(err)
 	}
 
 	i.currentHash = block.PrevBlockHash
@@ -117,99 +166,82 @@ func (i *BlockchainIterator) Next() *Block {
 	return block
 }
 
-func (b *Block) Serialize() []byte {
-	var result bytes.Buffer
-	encoder := gob.NewEncoder(&result)
-
-	err := encoder.Encode(b)
-	if err != nil {
-		panic(err)
+func dbExists() bool {
+	if _, err := os.Stat(dbFile); os.IsNotExist(err) {
+		return false
 	}
 
-	return result.Bytes()
+	return true
 }
 
-func DeserializeBlock(d []byte) *Block {
-	var block Block
-
-	decoder := gob.NewDecoder(bytes.NewReader(d))
-	err := decoder.Decode(&block)
-	if err != nil {
-		panic(err)
+func NewBlockchain(address string) *Blockchain {
+	if dbExists() == false {
+		fmt.Println("No existing blockchain found. Create one first.")
+		os.Exit(1)
 	}
 
-	return &block
-}
+	var tip []byte
+	db, err := bbolt.Open(dbFile, 0600, nil)
+	if err != nil {
+		log.Panic(err)
+	}
 
-func (bc *Blockchain) AddBlock(data string) {
-	var lastHash []byte
-
-	err := bc.db.View(func(tx *bbolt.Tx) error {
+	err = db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
-		lastHash = b.Get([]byte("l"))
+		tip = b.Get([]byte("l"))
 
 		return nil
 	})
+
 	if err != nil {
-		panic(err)
+		log.Panic(err)
 	}
 
-	newBlock := NewBlock(data, lastHash)
+	bc := Blockchain{tip, db}
 
-	err = bc.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(blocksBucket))
-		err = b.Put(newBlock.Hash, newBlock.Serialize())
-		err = b.Put([]byte("l"), newBlock.Hash)
-		bc.tip = newBlock.Hash
-
-		return nil
-	})
+	return &bc
 }
 
-func (pow *ProofOfWork) prepareData(nonce int) []byte {
-	data := bytes.Join(
-		[][]byte{
-			pow.block.PrevBlockHash,
-			pow.block.Data,
-			IntToHex(pow.block.Timestamp),
-			IntToHex(int64(targetBits)),
-			IntToHex(int64(nonce)),
-		}, []byte{},
-	)
-	return data
-}
+func CreateBlockchain(address string) *Blockchain {
+	if dbExists() {
+		fmt.Println("Blockchain already exists.")
+		os.Exit(1)
+	}
 
-func (pow *ProofOfWork) Run() (int, []byte) {
-	var hashInt big.Int
-	var hash [32]byte
-	nonce := 0
+	var tip []byte
+	db, err := bbolt.Open(dbFile, 0600, nil)
+	if err != nil {
+		log.Panic(err)
+	}
 
-	fmt.Printf("Mining the block containing \"%s\"\n", pow.block.Data)
-	for nonce < maxNonce {
-		data := pow.prepareData(nonce)
-		hash = sha256.Sum256(data)
-		fmt.Printf("\r%x", hash)
-		hashInt.SetBytes(hash[:])
+	err = db.Update(func(tx *bbolt.Tx) error {
+		cbtx := NewCoinbaseTX(address, genesisCoinbaseData)
+		genesis := NewGenesisBlock(cbtx)
 
-		if hashInt.Cmp(pow.target) == -1 {
-			break
-		} else {
-			nonce++
+		b, err := tx.CreateBucket([]byte(blocksBucket))
+		if err != nil {
+			log.Panic(err)
 		}
+
+		err = b.Put(genesis.Hash, genesis.Serialize())
+		if err != nil {
+			log.Panic(err)
+		}
+
+		err = b.Put([]byte("l"), genesis.Hash)
+		if err != nil {
+			log.Panic(err)
+		}
+		tip = genesis.Hash
+
+		return nil
+	})
+
+	if err != nil {
+		log.Panic(err)
 	}
-	fmt.Printf("\n\n")
 
-	return nonce, hash[:]
-}
+	bc := Blockchain{tip, db}
 
-func (pow *ProofOfWork) Validate() bool {
-	var hashInt big.Int
-
-	data := pow.prepareData(pow.block.Nonce)
-	hash := sha256.Sum256(data)
-	hashInt.SetBytes(hash[:])
-
-	isValid := hashInt.Cmp(pow.target) == -1
-
-	return isValid
+	return &bc
 }
